@@ -1,0 +1,22 @@
+[
+  {
+    "ParameterKey": "QueryLogGroupName",
+    "ParameterValue": "REPLACE_WITH_ZONE_STACK_OUTPUT"
+  },
+  {
+    "ParameterKey": "ServerHostname",
+    "ParameterValue": "mc.hamishburke.dev"
+  },
+  {
+    "ParameterKey": "ServerRegion",
+    "ParameterValue": "ap-southeast-6"
+  },
+  {
+    "ParameterKey": "AlertEmail",
+    "ParameterValue": "you@example.com"
+  },
+  {
+    "ParameterKey": "MonthlyBudgetUsd",
+    "ParameterValue": "7"
+  }
+]

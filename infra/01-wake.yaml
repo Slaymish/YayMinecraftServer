@@ -1,0 +1,162 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Wake-on-join for the Minecraft server, plus budget alerting.
+  MUST be deployed to us-east-1, alongside the query log group it subscribes to.
+  Deploy this stack LAST, after 02-server.yaml outputs an InstanceId.
+  The hosted zone and its query logging are owned by 00-zone.yaml.
+
+Parameters:
+  QueryLogGroupName:
+    Type: String
+    Description: QueryLogGroupName output from the 00-zone stack
+  ServerHostname:
+    Type: String
+    Description: Hostname to watch for, e.g. mc.hamishburke.dev
+  ServerRegion:
+    Type: String
+    Default: ap-southeast-6
+    Description: Region the Minecraft instance runs in
+  AlertEmail:
+    Type: String
+    Description: Email address for budget alerts
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 7
+    Description: >
+      Budget ceiling in USD ex GST. NZD 10 incl GST is roughly USD 5.80 ex GST
+      at NZD/USD 0.578 — 7 leaves headroom before alerting. Alerts only, no
+      automatic shutdown (US-14 relaxed to soft limits).
+
+Resources:
+  WakeFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: start-minecraft-instance
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # DescribeInstances does not support resource-level permissions
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              # Scoped by tag rather than instance ID, so a replaced instance
+              # stays covered without redeploying this stack
+              - Effect: Allow
+                Action: ec2:StartInstances
+                Resource: !Sub "arn:aws:ec2:${ServerRegion}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    "ec2:ResourceTag/Role": minecraft-server
+
+  WakeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Starts the Minecraft instance when its hostname is looked up
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt WakeFunctionRole.Arn
+      Environment:
+        Variables:
+          SERVER_REGION: !Ref ServerRegion
+      Code:
+        ZipFile: |
+          const {
+            EC2Client, DescribeInstancesCommand, StartInstancesCommand
+          } = require("@aws-sdk/client-ec2");
+
+          const ec2 = new EC2Client({ region: process.env.SERVER_REGION });
+
+          // Looked up by tag every invocation so a rebuilt instance still wakes
+          const FILTERS = [
+            { Name: "tag:Role", Values: ["minecraft-server"] },
+            {
+              Name: "instance-state-name",
+              Values: ["stopped", "stopping", "pending", "running"],
+            },
+          ];
+
+          exports.handler = async () => {
+            const described = await ec2.send(
+              new DescribeInstancesCommand({ Filters: FILTERS })
+            );
+            const instance = described.Reservations?.[0]?.Instances?.[0];
+
+            if (!instance) {
+              console.log("No instance tagged Role=minecraft-server found");
+              return { started: false };
+            }
+
+            const { InstanceId, State } = instance;
+            if (State.Name !== "stopped") {
+              console.log(`No action: ${InstanceId} is ${State.Name}`);
+              return { started: false, state: State.Name };
+            }
+
+            await ec2.send(new StartInstancesCommand({ InstanceIds: [InstanceId] }));
+            console.log(`Start issued for ${InstanceId}`);
+            return { started: true, instanceId: InstanceId };
+          };
+
+  WakeFunctionLogPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt WakeFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: !Sub "logs.${AWS::Region}.amazonaws.com"
+      SourceArn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${QueryLogGroupName}:*"
+
+  # Route 53 query logs are space-delimited plain text, so a bare substring
+  # match on the hostname is the right filter here.
+  WakeSubscription:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn: WakeFunctionLogPermission
+    Properties:
+      LogGroupName: !Ref QueryLogGroupName
+      FilterPattern: !Sub '"${ServerHostname}"'
+      DestinationArn: !GetAtt WakeFunction.Arn
+
+  # Budgets is a us-east-1 global service, which is why it lives in this stack.
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${AWS::StackName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref AlertEmail
+
+Outputs:
+  WakeFunctionName:
+    Value: !Ref WakeFunction
+  TailWakeLogsCommand:
+    Description: Watch wake events live while testing
+    Value: !Sub "aws logs tail /aws/lambda/${WakeFunction} --follow --region ${AWS::Region}"

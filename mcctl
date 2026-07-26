@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""Small terminal dashboard for the Minecraft server. Stdlib only.
+
+Everything here shells out to the AWS CLI, so it needs no packages and no
+credentials of its own. Run it with `./mcctl` or `make tui`.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, timedelta
+
+REPO = os.path.dirname(os.path.abspath(__file__))
+
+PROFILE = os.environ.get("AWS_PROFILE", "personal")
+SERVER_REGION = os.environ.get("SERVER_REGION", "ap-southeast-6")
+WAKE_REGION = "us-east-1"
+HOSTNAME = os.environ.get("HOSTNAME_OVERRIDE", "mc.hamishburke.dev")
+
+ZONE_STACK = "minecraft-zone"
+SERVER_STACK = "minecraft-server"
+WAKE_STACK = "minecraft-wake"
+
+# Rough conversion for the cost display only. USD is what AWS actually bills.
+NZD_PER_USD = 1.73
+GST = 1.15
+
+DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
+GREEN, YELLOW, RED, BLUE = "\033[32m", "\033[33m", "\033[31m", "\033[36m"
+
+
+# --------------------------------------------------------------- shell helpers
+
+def run(args, timeout=60):
+    """Run a command, returning (ok, stdout). Never raises."""
+    env = dict(os.environ, AWS_PROFILE=PROFILE)
+    try:
+        done = subprocess.run(args, capture_output=True, text=True,
+                              timeout=timeout, cwd=REPO, env=env)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as err:
+        return False, str(err)
+    return done.returncode == 0, (done.stdout or done.stderr).strip()
+
+
+def aws(args, timeout=60):
+    """Run an aws CLI call expecting JSON back."""
+    ok, out = run(["aws"] + args + ["--output", "json"], timeout)
+    if not ok:
+        return None
+    try:
+        return json.loads(out) if out else None
+    except json.JSONDecodeError:
+        return None
+
+
+# ------------------------------------------------------------------- gatherers
+
+def stack_state(name, region):
+    data = aws(["cloudformation", "describe-stacks",
+                "--stack-name", name, "--region", region])
+    if not data:
+        return "not deployed"
+    return data["Stacks"][0]["StackStatus"]
+
+
+def stack_output(name, region, key):
+    data = aws(["cloudformation", "describe-stacks",
+                "--stack-name", name, "--region", region])
+    if not data:
+        return None
+    for out in data["Stacks"][0].get("Outputs", []):
+        if out["OutputKey"] == key:
+            return out["OutputValue"]
+    return None
+
+
+def instance_info():
+    """Return (state, public_ip, instance_id)."""
+    instance_id = stack_output(SERVER_STACK, SERVER_REGION, "InstanceId")
+    if not instance_id:
+        return "not deployed", None, None
+    data = aws(["ec2", "describe-instances", "--instance-ids", instance_id,
+                "--region", SERVER_REGION])
+    if not data or not data["Reservations"]:
+        return "unknown", None, instance_id
+    inst = data["Reservations"][0]["Instances"][0]
+    return inst["State"]["Name"], inst.get("PublicIpAddress"), instance_id
+
+
+def dns_record():
+    """Read the A record from Route 53 itself.
+
+    `dig` would answer from a resolver cache, which lies for up to the TTL after
+    the instance publishes a new IP — misleading on a status screen.
+    """
+    zone_id = stack_output(ZONE_STACK, WAKE_REGION, "HostedZoneId")
+    if not zone_id:
+        return None
+    data = aws(["route53", "list-resource-record-sets",
+                "--hosted-zone-id", zone_id,
+                "--query", f"ResourceRecordSets[?Name=='{HOSTNAME}.'"
+                            "&&Type=='A'].ResourceRecords[0].Value"])
+    return data[0] if data else None
+
+
+def delegation():
+    ok, out = run(["dig", "+short", "NS", HOSTNAME], timeout=15)
+    if not ok:
+        return "unknown", 0
+    servers = [line for line in out.splitlines() if "awsdns" in line]
+    return ("ok" if len(servers) >= 2 else "not delegated"), len(servers)
+
+
+def params_ready():
+    """Flag placeholder values still sitting in the parameter files."""
+    missing = []
+    for name in ("server.json", "wake.json"):
+        path = os.path.join(REPO, "infra", "params", name)
+        if not os.path.exists(path):
+            missing.append(f"{name} absent")
+            continue
+        body = open(path).read()
+        for key in ("FILL_ME_IN", "FILL_FROM_make_outputs", "REPLACE_WITH"):
+            if key in body:
+                missing.append(name)
+                break
+    return missing
+
+
+def month_to_date_cost():
+    """Cost Explorer month-to-date, grouped by service. Costs $0.01 per call."""
+    today = date.today()
+    start = today.replace(day=1).isoformat()
+    end = (today + timedelta(days=1)).isoformat()
+    data = aws(["ce", "get-cost-and-usage", "--region", WAKE_REGION,
+                "--time-period", f"Start={start},End={end}",
+                "--granularity", "MONTHLY", "--metrics", "UnblendedCost",
+                "--group-by", "Type=DIMENSION,Key=SERVICE"], timeout=90)
+    if not data or not data.get("ResultsByTime"):
+        return None
+    rows = []
+    for group in data["ResultsByTime"][0]["Groups"]:
+        amount = float(group["Metrics"]["UnblendedCost"]["Amount"])
+        if amount > 0.001:
+            rows.append((group["Keys"][0], amount))
+    rows.sort(key=lambda row: -row[1])
+    return rows
+
+
+# ------------------------------------------------------------------- rendering
+
+STATE_COLOURS = {
+    "running": GREEN, "stopped": DIM, "pending": YELLOW,
+    "stopping": YELLOW, "not deployed": RED, "unknown": YELLOW,
+}
+
+
+def colour_stack(status):
+    if status == "not deployed":
+        return f"{RED}not deployed{RESET}"
+    if status.endswith("_COMPLETE") and "ROLLBACK" not in status:
+        return f"{GREEN}{status}{RESET}"
+    if "IN_PROGRESS" in status:
+        return f"{YELLOW}{status}{RESET}"
+    return f"{RED}{status}{RESET}"
+
+
+def gather():
+    """Fetch everything in parallel — serial AWS calls make this feel sluggish."""
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        jobs = {
+            "zone": pool.submit(stack_state, ZONE_STACK, WAKE_REGION),
+            "server": pool.submit(stack_state, SERVER_STACK, SERVER_REGION),
+            "wake": pool.submit(stack_state, WAKE_STACK, WAKE_REGION),
+            "instance": pool.submit(instance_info),
+            "dns": pool.submit(dns_record),
+            "delegation": pool.submit(delegation),
+        }
+        return {key: job.result() for key, job in jobs.items()}
+
+
+def render(snapshot, cost_rows, notes):
+    os.system("clear")
+    state, ip, _ = snapshot["instance"]
+    deleg, ns_count = snapshot["delegation"]
+
+    print(f"\n  {BOLD}MINECRAFT SERVER{RESET}  {DIM}{HOSTNAME}{RESET}\n")
+
+    print(f"  {BOLD}Infrastructure{RESET}")
+    print(f"    Zone stack       {colour_stack(snapshot['zone'])}")
+    print(f"    Server stack     {colour_stack(snapshot['server'])}")
+    print(f"    Wake stack       {colour_stack(snapshot['wake'])}")
+    deleg_text = (f"{GREEN}ok{RESET} {DIM}({ns_count} AWS nameservers){RESET}"
+                  if deleg == "ok" else f"{RED}{deleg}{RESET}")
+    print(f"    Delegation       {deleg_text}\n")
+
+    colour = STATE_COLOURS.get(state, YELLOW)
+    print(f"  {BOLD}Server{RESET}")
+    print(f"    State            {colour}{state}{RESET}")
+    print(f"    Public IP        {ip or '—'}")
+    dns = snapshot["dns"]
+    if dns == "192.0.2.1":
+        dns = f"{DIM}192.0.2.1 (asleep placeholder){RESET}"
+    print(f"    DNS A record     {dns or '—'}\n")
+
+    print(f"  {BOLD}Cost this month{RESET}")
+    if cost_rows is None:
+        print(f"    {DIM}press [c] to load  (Cost Explorer, $0.01 per query){RESET}\n")
+    elif not cost_rows:
+        print(f"    {DIM}nothing billed yet{RESET}\n")
+    else:
+        total = sum(amount for _, amount in cost_rows)
+        for service, amount in cost_rows[:6]:
+            print(f"    {service[:28]:<30} {DIM}USD{RESET} {amount:>7.2f}")
+        nzd = total * NZD_PER_USD * GST
+        print(f"    {BOLD}{'total':<30} USD {total:>7.2f}{RESET}"
+              f"  {DIM}≈ NZD {nzd:.2f} incl GST{RESET}\n")
+
+    for note in notes:
+        print(f"  {YELLOW}!{RESET} {note}")
+    if notes:
+        print()
+
+    print(f"  {DIM}{'─' * 66}{RESET}")
+    print(f"  [r] refresh   [s] start    [x] stop      [c] cost")
+    print(f"  [w] whitelist add          [l] whitelist list")
+    print(f"  [b] backup now             [k] list backups")
+    print(f"  [t] tail logs [e] shell    [d] deploy    [q] quit")
+    print()
+
+
+# --------------------------------------------------------------------- actions
+
+def ssm_run(instance_id, command, label):
+    """Run a shell command on the instance and wait for its output."""
+    data = aws(["ssm", "send-command", "--region", SERVER_REGION,
+                "--instance-ids", instance_id,
+                "--document-name", "AWS-RunShellScript",
+                "--parameters", json.dumps({"commands": [command]})])
+    if not data:
+        return f"{RED}could not send command — is SSM ready?{RESET}"
+    command_id = data["Command"]["CommandId"]
+    print(f"  {DIM}{label}...{RESET}")
+    for _ in range(20):
+        time.sleep(2)
+        result = aws(["ssm", "get-command-invocation", "--region", SERVER_REGION,
+                      "--command-id", command_id, "--instance-id", instance_id])
+        if result and result["Status"] in ("Success", "Failed"):
+            out = (result.get("StandardOutputContent")
+                   or result.get("StandardErrorContent") or "(no output)")
+            return out.strip()
+    return f"{YELLOW}timed out waiting for the instance{RESET}"
+
+
+def require_running(snapshot):
+    state, _, instance_id = snapshot["instance"]
+    if state != "running":
+        print(f"\n  {YELLOW}Server is {state}. Start it first with [s].{RESET}")
+        return None
+    return instance_id
+
+
+def action_whitelist_add(snapshot):
+    instance_id = require_running(snapshot)
+    if not instance_id:
+        return
+    name = input("\n  Minecraft username to add: ").strip()
+    if not name:
+        return
+    print("\n" + ssm_run(instance_id,
+                         f'/usr/local/bin/mc-rcon "whitelist add {name}"',
+                         f"adding {name}"))
+
+
+def action_whitelist_list(snapshot):
+    instance_id = require_running(snapshot)
+    if not instance_id:
+        return
+    print("\n" + ssm_run(instance_id, '/usr/local/bin/mc-rcon "whitelist list"',
+                         "reading whitelist"))
+
+
+def action_backup(snapshot):
+    instance_id = require_running(snapshot)
+    if not instance_id:
+        return
+    print("\n" + ssm_run(instance_id, "/usr/local/bin/mc-backup.sh",
+                         "archiving world to S3"))
+
+
+def action_list_backups():
+    bucket = stack_output(SERVER_STACK, SERVER_REGION, "BackupBucketName")
+    if not bucket:
+        print(f"\n  {YELLOW}Server stack not deployed yet.{RESET}")
+        return
+    ok, out = run(["aws", "s3", "ls", f"s3://{bucket}/worlds/", "--human-readable"])
+    print("\n" + (out or "  no archives yet"))
+
+
+def action_power(snapshot, start):
+    state, _, instance_id = snapshot["instance"]
+    if not instance_id:
+        print(f"\n  {YELLOW}Server stack not deployed yet.{RESET}")
+        return
+    verb = "start" if start else "stop"
+    aws(["ec2", f"{verb}-instances", "--region", SERVER_REGION,
+         "--instance-ids", instance_id])
+    print(f"\n  {GREEN}{verb} issued{RESET} — takes a moment to take effect.")
+
+
+def action_deploy():
+    print(f"\n  1) server stack   2) wake stack   3) both   [enter] cancel")
+    choice = input("  > ").strip()
+    targets = {"1": ["deploy-server"], "2": ["deploy-wake"],
+               "3": ["deploy-server", "deploy-wake"]}.get(choice)
+    if not targets:
+        return
+    for target in targets:
+        print(f"\n  {BLUE}make {target}{RESET}\n")
+        subprocess.run(["make", target], cwd=REPO,
+                       env=dict(os.environ, AWS_PROFILE=PROFILE))
+
+
+def action_interactive(snapshot, command):
+    """Hand the terminal over to an SSM session."""
+    instance_id = require_running(snapshot)
+    if not instance_id:
+        return
+    args = ["aws", "ssm", "start-session", "--region", SERVER_REGION,
+            "--target", instance_id]
+    if command:
+        args += ["--document-name", "AWS-StartInteractiveCommand",
+                 "--parameters", json.dumps({"command": [command]})]
+    subprocess.run(args, env=dict(os.environ, AWS_PROFILE=PROFILE))
+
+
+# ------------------------------------------------------------------------ main
+
+def main():
+    cost_rows = None
+    snapshot = None
+    while True:
+        if snapshot is None:
+            print(f"\n  {DIM}checking...{RESET}")
+            snapshot = gather()
+
+        notes = []
+        pending = params_ready()
+        if pending:
+            notes.append(f"parameters still need filling in: {', '.join(pending)}")
+        if snapshot["server"] == "not deployed":
+            notes.append("server stack not deployed — press [d] to deploy")
+
+        render(snapshot, cost_rows, notes)
+
+        try:
+            key = input("  > ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+
+        if key == "q":
+            return
+        if key == "r":
+            snapshot = None
+            continue
+        if key == "c":
+            print(f"\n  {DIM}querying Cost Explorer...{RESET}")
+            cost_rows = month_to_date_cost()
+            if cost_rows is None:
+                print(f"  {YELLOW}No cost data. Cost Explorer can take 24h to "
+                      f"populate on a new account.{RESET}")
+                input("  enter to continue ")
+            continue
+
+        handlers = {
+            "s": lambda: action_power(snapshot, True),
+            "x": lambda: action_power(snapshot, False),
+            "w": lambda: action_whitelist_add(snapshot),
+            "l": lambda: action_whitelist_list(snapshot),
+            "b": lambda: action_backup(snapshot),
+            "k": action_list_backups,
+            "d": action_deploy,
+            "t": lambda: action_interactive(snapshot, "sudo journalctl -u minecraft -f"),
+            "e": lambda: action_interactive(snapshot, None),
+        }
+        handler = handlers.get(key)
+        if not handler:
+            continue
+        handler()
+        input(f"\n  {DIM}enter to continue{RESET} ")
+        snapshot = None
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        sys.exit(0)

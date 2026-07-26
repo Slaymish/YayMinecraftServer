@@ -1,0 +1,13 @@
+# Local parameter files — may contain your domain, email, Minecraft usernames
+infra/params/*.json
+!infra/params/*.example.json
+
+# AWS CLI / packaged templates
+.aws-sam/
+packaged-*.yaml
+
+# Downloaded world archives
+world-archives/
+*.tar.gz
+
+.DS_Store

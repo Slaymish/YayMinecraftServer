@@ -1,0 +1,833 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Paper Minecraft server on EC2 in ap-southeast-6 (Auckland), stopped when idle.
+  Deploy order: 00-zone.yaml, then delegate in Cloudflare, then this, then 01-wake.yaml
+  (which needs the InstanceId this stack outputs).
+
+Parameters:
+  HostedZoneId:
+    Type: String
+    Description: Route 53 hosted zone ID for a domain you own (see README prerequisites)
+  ServerHostname:
+    Type: String
+    Description: Full hostname players connect to, e.g. mc.hamishburke.dev
+  AlertEmail:
+    Type: String
+    Description: Email address for outage and budget alerts (you must confirm the subscription)
+  MinecraftVersion:
+    Type: String
+    Default: latest
+    Description: >
+      Minecraft version to pin (e.g. 26.1.2), or "latest" to resolve the newest
+      version that has a STABLE Paper build. "latest" deliberately skips BETA and
+      ALPHA channels — as of July 2026 that means 26.1.2, not 26.2.
+  QolPlugins:
+    Type: String
+    Default: essentialsx,gravesx
+    Description: >
+      Comma-separated Modrinth slugs installed at boot (US-18). Defaults give
+      /home and /tpa via EssentialsX, and item-preserving graves via GravesX.
+      Set empty to install no plugins.
+  PlayersSleepingPercentage:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 100
+    Description: >
+      Percent of online players who must sleep to skip the night. 1 = one player
+      sleeping is enough (US-18). Vanilla default is 100. Applied as a gamerule
+      on every boot.
+  WhitelistUsernames:
+    Type: String
+    Default: ""
+    Description: Comma-separated Minecraft usernames to whitelist, e.g. Notch,jeb_
+  OperatorUsername:
+    Type: String
+    Default: ""
+    Description: Minecraft username granted operator (level 4)
+  InstanceType:
+    Type: String
+    Default: t4g.medium
+    AllowedValues: [t4g.small, t4g.medium, t4g.large]
+    Description: t4g.medium = 2 vCPU / 4GB, sized for 6 concurrent players (US-19)
+  VolumeSizeGb:
+    Type: Number
+    Default: 20
+    MinValue: 8
+    MaxValue: 100
+    Description: Root EBS size. Billed while stopped — this is the dominant fixed cost.
+  JavaHeapMb:
+    Type: Number
+    Default: 3072
+    Description: JVM heap. Leave ~1GB headroom below instance RAM for the OS.
+  IdleShutdownMinutes:
+    Type: Number
+    Default: 20
+    Description: Minutes with zero connected players before the instance stops itself
+  MaxPlayers:
+    Type: Number
+    Default: 8
+  Difficulty:
+    Type: String
+    Default: normal
+    AllowedValues: [peaceful, easy, normal, hard]
+  ViewDistance:
+    Type: Number
+    Default: 10
+  SimulationDistance:
+    Type: Number
+    Default: 8
+  LatestAmiId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Leave as default — resolves the current Amazon Linux 2023 ARM64 AMI
+
+Resources:
+  # ---------------------------------------------------------------- networking
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-vpc" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-igw" }]
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Port 25565 is open to the world by design: Minecraft has no IP allowlist and
+  # players are on residential connections. Access control is the whitelist (US-07).
+  ServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Minecraft Java Edition inbound
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 25565
+          ToPort: 25565
+          CidrIp: 0.0.0.0/0
+          Description: Minecraft Java
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-sg" }]
+
+  # ------------------------------------------------------------------- storage
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: cheapen-old-archives
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 90
+
+  # --------------------------------------------------------------------- IAM
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Session Manager shell access without SSH keys or an open port 22
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: server-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Update its own A record on boot — the public IP changes every start
+              - Effect: Allow
+                Action: route53:ChangeResourceRecordSets
+                Resource: !Sub "arn:aws:route53:::hostedzone/${HostedZoneId}"
+              - Effect: Allow
+                Action: route53:GetChange
+                Resource: "*"
+              - Effect: Allow
+                Action: [s3:PutObject, s3:AbortMultipartUpload]
+                Resource: !Sub "${BackupBucket.Arn}/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt BackupBucket.Arn
+              # Disk warnings are published straight to SNS — publishing a custom
+              # CloudWatch metric instead would cost more than the alert is worth
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ------------------------------------------------------------------ compute
+  MinecraftServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!Ref ServerSecurityGroup]
+      # "stop" not "terminate" — the idle watchdog calls shutdown -h
+      InstanceInitiatedShutdownBehavior: stop
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref VolumeSizeGb
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-paper"
+        - Key: Backup
+          Value: minecraft
+        # The wake Lambda finds the instance by this tag rather than by a
+        # hardcoded ID, so replacing the instance doesn't break wake-on-join
+        - Key: Role
+          Value: minecraft-server
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > >(tee /var/log/mc-bootstrap.log | logger -t mc-bootstrap) 2>&1
+
+          # Minecraft 26.1+ refuses to start on anything below Java 25.
+          # iproute gives us `ss`, which the idle watchdog counts players with.
+          dnf -y install java-25-amazon-corretto-headless jq tar iproute
+
+          id minecraft &>/dev/null || useradd -r -m -d /opt/minecraft minecraft
+          install -d -o minecraft -g minecraft /opt/minecraft/server
+          cd /opt/minecraft/server
+
+          # ------------------------------- fetch Paper + QoL plugins (verified)
+          # PaperMC's v2 API was sunset (HTTP 410); fill.papermc.io/v3 replaces it
+          # and helpfully returns a sha256 for each build, so we verify downloads.
+          cat > /usr/local/bin/mc-fetch.py <<'FETCHEOF'
+          #!/usr/bin/env python3
+          """Download the Paper server jar and QoL plugins, verifying checksums."""
+          import hashlib, json, os, urllib.parse, urllib.request
+
+          SERVER_DIR = "/opt/minecraft/server"
+          PLUGIN_DIR = os.path.join(SERVER_DIR, "plugins")
+          FILL = "https://fill.papermc.io/v3/projects/paper"
+          MODRINTH = "https://api.modrinth.com/v2"
+          HEADERS = {"User-Agent": "MCServer-bootstrap/1.0 (personal server)"}
+
+
+          def get_json(url):
+              req = urllib.request.Request(url, headers=HEADERS)
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.load(resp)
+
+
+          def download(url, dest, algo=None, expected=None):
+              req = urllib.request.Request(url, headers=HEADERS)
+              with urllib.request.urlopen(req, timeout=600) as resp:
+                  data = resp.read()
+              if expected:
+                  actual = hashlib.new(algo, data).hexdigest()
+                  if actual != expected:
+                      raise SystemExit(f"checksum mismatch for {dest}")
+              with open(dest, "wb") as handle:
+                  handle.write(data)
+              print(f"fetched {os.path.basename(dest)}")
+
+
+          def resolve_paper(requested):
+              """Newest STABLE build, or the exact version asked for."""
+              if requested and requested != "latest":
+                  return requested, get_json(f"{FILL}/versions/{requested}/builds/latest")
+              for _, versions in get_json(FILL)["versions"].items():
+                  for version in versions:
+                      if "-" in version:  # skip rc/pre/snapshot builds
+                          continue
+                      try:
+                          build = get_json(f"{FILL}/versions/{version}/builds/latest")
+                      except Exception:
+                          continue
+                      if build.get("channel") == "STABLE":
+                          return version, build
+              raise SystemExit("no stable Paper build found")
+
+
+          def install_plugins(slugs, game_version):
+              if not slugs:
+                  print("no plugins requested")
+                  return
+              os.makedirs(PLUGIN_DIR, exist_ok=True)
+              for slug in slugs:
+                  query = urllib.parse.urlencode({
+                      "loaders": '["paper"]',
+                      "game_versions": f'["{game_version}"]',
+                  })
+                  try:
+                      versions = get_json(f"{MODRINTH}/project/{slug}/version?{query}")
+                  except Exception as err:
+                      print(f"skipping {slug}: {err}")
+                      continue
+                  if not versions:
+                      print(f"skipping {slug}: no build for {game_version}")
+                      continue
+                  release = versions[0]
+                  files = release["files"]
+                  primary = next((f for f in files if f.get("primary")), files[0])
+                  download(primary["url"], os.path.join(PLUGIN_DIR, primary["filename"]),
+                           "sha512", primary.get("hashes", {}).get("sha512"))
+                  print(f"  {slug} {release['version_number']}")
+
+
+          requested = os.environ.get("REQUESTED_VERSION", "latest").strip()
+          version, build = resolve_paper(requested)
+          jar = build["downloads"]["server:default"]
+          download(jar["url"], os.path.join(SERVER_DIR, "paper.jar"),
+                   "sha256", jar["checksums"]["sha256"])
+
+          with open(os.path.join(SERVER_DIR, "VERSION"), "w") as handle:
+              handle.write(f"{version} build {build['id']} ({build['channel']})\n")
+          with open(os.path.join(SERVER_DIR, "MCVERSION"), "w") as handle:
+              handle.write(version)
+
+          slugs = [s.strip() for s in os.environ.get("QOL_PLUGINS", "").split(",") if s.strip()]
+          install_plugins(slugs, version)
+          FETCHEOF
+          chmod +x /usr/local/bin/mc-fetch.py
+
+          export REQUESTED_VERSION="${MinecraftVersion}"
+          export QOL_PLUGINS="${QolPlugins}"
+          python3 /usr/local/bin/mc-fetch.py
+          MCVER=$(cat /opt/minecraft/server/MCVERSION)
+
+          echo "eula=true" > eula.txt
+
+          # ------------------------------------------------ server.properties
+          # RCON lets us set gamerules and flush saves before backups. Port 25575
+          # is not in the security group, so it is only reachable on the box itself.
+          if [ ! -f /opt/minecraft/rcon.pass ]; then
+            python3 -c "import secrets; print(secrets.token_hex(24))" > /opt/minecraft/rcon.pass
+          fi
+          chmod 600 /opt/minecraft/rcon.pass
+          RCON_PASS=$(cat /opt/minecraft/rcon.pass)
+
+          # Only written on first boot so in-game config changes survive restarts
+          if [ ! -f server.properties ]; then
+            cat > server.properties <<PROPS
+          motd=Paper server - whitelist only
+          server-port=25565
+          online-mode=true
+          white-list=true
+          enforce-whitelist=true
+          max-players=${MaxPlayers}
+          difficulty=${Difficulty}
+          view-distance=${ViewDistance}
+          simulation-distance=${SimulationDistance}
+          spawn-protection=0
+          enable-command-block=false
+          enable-rcon=true
+          rcon.port=25575
+          rcon.password=${!RCON_PASS}
+          broadcast-rcon-to-ops=false
+          PROPS
+          fi
+
+          # -------------------------------------- whitelist + ops from Mojang
+          # Exported so the heredoc'd Python below can read them from the environment
+          export WHITELIST_NAMES="${WhitelistUsernames}"
+          export OP_NAME="${OperatorUsername}"
+          python3 - <<'PYEOF'
+          import json, os, urllib.request
+
+          def uuid_for(name):
+              url = f"https://api.mojang.com/users/profiles/minecraft/{name}"
+              try:
+                  with urllib.request.urlopen(url, timeout=10) as r:
+                      raw = json.load(r)["id"]
+              except Exception as e:
+                  print(f"could not resolve {name}: {e}")
+                  return None
+              return f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+
+          names = [n.strip() for n in os.environ.get("WHITELIST_NAMES", "").split(",") if n.strip()]
+          entries = []
+          for n in names:
+              u = uuid_for(n)
+              if u:
+                  entries.append({"uuid": u, "name": n})
+          if entries:
+              with open("/opt/minecraft/server/whitelist.json", "w") as f:
+                  json.dump(entries, f, indent=2)
+
+          op = os.environ.get("OP_NAME", "").strip()
+          if op:
+              u = uuid_for(op)
+              if u:
+                  with open("/opt/minecraft/server/ops.json", "w") as f:
+                      json.dump([{"uuid": u, "name": op, "level": 4,
+                                  "bypassesPlayerLimit": False}], f, indent=2)
+          PYEOF
+
+          chown -R minecraft:minecraft /opt/minecraft
+
+          # ------------------------------------------------------- RCON client
+          cat > /usr/local/bin/mc-rcon <<'RCONEOF'
+          #!/usr/bin/env python3
+          """Minimal Minecraft RCON client. Usage: mc-rcon <command...>"""
+          import socket, struct, sys
+
+          AUTH, COMMAND, AUTH_RESPONSE = 3, 2, 2
+
+
+          def encode(request_id, packet_type, body):
+              payload = struct.pack("<ii", request_id, packet_type) + body.encode() + b"\x00\x00"
+              return struct.pack("<i", len(payload)) + payload
+
+
+          def read_exactly(sock, count):
+              chunks = b""
+              while len(chunks) < count:
+                  chunk = sock.recv(count - len(chunks))
+                  if not chunk:
+                      raise SystemExit("rcon: connection closed")
+                  chunks += chunk
+              return chunks
+
+
+          def decode(sock):
+              (length,) = struct.unpack("<i", read_exactly(sock, 4))
+              data = read_exactly(sock, length)
+              request_id, _ = struct.unpack("<ii", data[:8])
+              return request_id, data[8:-2].decode(errors="replace")
+
+
+          def main():
+              command = " ".join(sys.argv[1:])
+              if not command:
+                  raise SystemExit("usage: mc-rcon <command>")
+              with open("/opt/minecraft/rcon.pass") as handle:
+                  password = handle.read().strip()
+              with socket.create_connection(("127.0.0.1", 25575), timeout=10) as sock:
+                  sock.sendall(encode(1, AUTH, password))
+                  request_id, _ = decode(sock)
+                  if request_id == -1:
+                      raise SystemExit("rcon: authentication failed")
+                  sock.sendall(encode(2, COMMAND, command))
+                  _, body = decode(sock)
+                  if body.strip():
+                      print(body)
+
+
+          main()
+          RCONEOF
+          chmod 750 /usr/local/bin/mc-rcon
+
+          # ------------------------------------------ apply gamerules on boot
+          cat > /usr/local/bin/mc-configure.sh <<'CONFEOF'
+          #!/bin/bash
+          set -euo pipefail
+          # Gamerules are snake_case from Minecraft 26.x onward — the old
+          # playersSleepingPercentage spelling is rejected by the command parser.
+          RULE="players_sleeping_percentage"
+
+          # Wait for the server to finish starting before issuing commands
+          for _ in $(seq 1 60); do
+            if /usr/local/bin/mc-rcon list >/dev/null 2>&1; then
+              RESPONSE=$(/usr/local/bin/mc-rcon "gamerule $RULE __SLEEPPCT__")
+              # RCON exits 0 even when the server rejects a command, so the
+              # response text is the only real confirmation
+              case "$RESPONSE" in
+                *"is now set to"*)
+                  logger -t mc-configure "$RESPONSE"
+                  exit 0 ;;
+                *)
+                  logger -t mc-configure "gamerule REJECTED: $RESPONSE"
+                  exit 1 ;;
+              esac
+            fi
+            sleep 5
+          done
+          logger -t mc-configure "server never became reachable over rcon"
+          exit 1
+          CONFEOF
+          sed -i "s|__SLEEPPCT__|${PlayersSleepingPercentage}|g" /usr/local/bin/mc-configure.sh
+          chmod +x /usr/local/bin/mc-configure.sh
+
+          # ------------------------------------------- Route 53 record updater
+          cat > /usr/local/bin/mc-dns-update.sh <<'DNSEOF'
+          #!/bin/bash
+          set -euo pipefail
+          TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+                  -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+          IP=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
+               http://169.254.169.254/latest/meta-data/public-ipv4)
+          cat > /tmp/rrset.json <<JSON
+          {"Changes":[{"Action":"UPSERT","ResourceRecordSet":{
+            "Name":"__HOSTNAME__","Type":"A","TTL":60,
+            "ResourceRecords":[{"Value":"$IP"}]}}]}
+          JSON
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id __ZONEID__ --change-batch file:///tmp/rrset.json
+          logger -t mc-dns "updated __HOSTNAME__ -> $IP"
+          DNSEOF
+          sed -i "s|__HOSTNAME__|${ServerHostname}|g; s|__ZONEID__|${HostedZoneId}|g" \
+            /usr/local/bin/mc-dns-update.sh
+          chmod +x /usr/local/bin/mc-dns-update.sh
+
+          # ------------------------------------------------------ backup to S3
+          cat > /usr/local/bin/mc-backup.sh <<'BAKEOF'
+          #!/bin/bash
+          set -euo pipefail
+          cd /opt/minecraft/server
+          STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+
+          # Flush and pause writes so the archive isn't a torn copy. These no-op
+          # harmlessly when the server is already stopped (the idle path).
+          /usr/local/bin/mc-rcon save-off >/dev/null 2>&1 || true
+          /usr/local/bin/mc-rcon "save-all flush" >/dev/null 2>&1 || true
+          sleep 5
+
+          tar -czf "/tmp/world-$STAMP.tar.gz" world world_nether world_the_end 2>/dev/null || \
+            tar -czf "/tmp/world-$STAMP.tar.gz" world
+
+          /usr/local/bin/mc-rcon save-on >/dev/null 2>&1 || true
+
+          aws s3 cp "/tmp/world-$STAMP.tar.gz" "s3://__BUCKET__/worlds/world-$STAMP.tar.gz"
+          rm -f "/tmp/world-$STAMP.tar.gz"
+          logger -t mc-backup "uploaded world-$STAMP.tar.gz"
+          BAKEOF
+          sed -i "s|__BUCKET__|${BackupBucket}|g" /usr/local/bin/mc-backup.sh
+          chmod +x /usr/local/bin/mc-backup.sh
+
+          # --------------------------------------------------- idle watchdog
+          cat > /usr/local/bin/mc-idle-watchdog.sh <<'IDLEEOF'
+          #!/bin/bash
+          set -euo pipefail
+          COUNTER=/run/mc-idle-count
+          BOOT_GRACE=600
+          LIMIT=__IDLELIMIT__
+
+          # Don't shut down before someone has had a chance to connect after wake
+          UP=$(cut -d. -f1 /proc/uptime)
+          [ "$UP" -lt "$BOOT_GRACE" ] && exit 0
+
+          PLAYERS=$(ss -Htn state established '( sport = :25565 )' 2>/dev/null | wc -l)
+          if [ "$PLAYERS" -gt 0 ]; then
+            echo 0 > "$COUNTER"
+            exit 0
+          fi
+
+          COUNT=$(cat "$COUNTER" 2>/dev/null || echo 0)
+          COUNT=$((COUNT + 1))
+          echo "$COUNT" > "$COUNTER"
+          [ "$COUNT" -lt "$LIMIT" ] && exit 0
+
+          logger -t mc-idle "idle ${!COUNT}m, backing up and stopping instance"
+          systemctl stop minecraft.service || true
+          /usr/local/bin/mc-backup.sh || logger -t mc-idle "backup failed, stopping anyway"
+          shutdown -h now
+          IDLEEOF
+          sed -i "s|__IDLELIMIT__|${IdleShutdownMinutes}|g" /usr/local/bin/mc-idle-watchdog.sh
+          chmod +x /usr/local/bin/mc-idle-watchdog.sh
+
+          # ------------------------------------------------- disk space warning
+          cat > /usr/local/bin/mc-health-check.sh <<'HEALTHEOF'
+          #!/bin/bash
+          set -euo pipefail
+          FLAG=/run/mc-disk-warned
+          THRESHOLD=85
+          USED=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+          if [ "$USED" -lt "$THRESHOLD" ]; then
+            rm -f "$FLAG"
+            exit 0
+          fi
+          # Warn once per boot so a full disk doesn't spam the inbox
+          [ -f "$FLAG" ] && exit 0
+          touch "$FLAG"
+          aws sns publish --region __REGION__ --topic-arn __TOPICARN__ \
+            --subject "Minecraft server disk ${!USED}% full" \
+            --message "Root volume on the Minecraft server is ${!USED}% full (warns at ${!THRESHOLD}%).
+          Increase VolumeSizeGb in infra/params/server.json and redeploy, or prune the world."
+          logger -t mc-health "disk at ${!USED}%, alert sent"
+          HEALTHEOF
+          sed -i "s|__REGION__|${AWS::Region}|g; s|__TOPICARN__|${AlertTopic}|g" \
+            /usr/local/bin/mc-health-check.sh
+          chmod +x /usr/local/bin/mc-health-check.sh
+
+          cat > /etc/systemd/system/mc-health-check.service <<'UNITEOF'
+          [Unit]
+          Description=Warn by email when the root volume is filling up
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/mc-health-check.sh
+          UNITEOF
+
+          cat > /etc/systemd/system/mc-health-check.timer <<'UNITEOF'
+          [Unit]
+          Description=Hourly disk space check
+
+          [Timer]
+          OnBootSec=15min
+          OnUnitActiveSec=1h
+
+          [Install]
+          WantedBy=timers.target
+          UNITEOF
+
+          # ------------------------------------------------------ systemd units
+          cat > /etc/systemd/system/mc-dns-update.service <<'UNITEOF'
+          [Unit]
+          Description=Publish current public IP to Route 53
+          After=network-online.target cloud-init.service
+          Wants=network-online.target
+          Before=minecraft.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/bin/mc-dns-update.sh
+
+          [Install]
+          WantedBy=multi-user.target
+          UNITEOF
+
+          cat > /etc/systemd/system/minecraft.service <<UNITEOF
+          [Unit]
+          Description=Paper Minecraft Server
+          After=network-online.target mc-dns-update.service
+          Wants=network-online.target
+          # Give up after 3 crashes in 10 min rather than restart-looping (US-10)
+          StartLimitIntervalSec=600
+          StartLimitBurst=3
+
+          [Service]
+          Type=simple
+          User=minecraft
+          WorkingDirectory=/opt/minecraft/server
+          ExecStart=/usr/lib/jvm/java-25-amazon-corretto/bin/java -Xms${JavaHeapMb}M -Xmx${JavaHeapMb}M \\
+            -XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 \\
+            -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC \\
+            -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 \\
+            -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 \\
+            -jar paper.jar --nogui
+          Restart=on-failure
+          RestartSec=15
+          # Paper's shutdown hook saves the world on SIGTERM; give it room
+          KillSignal=SIGTERM
+          TimeoutStopSec=120
+          SuccessExitStatus=0 143
+
+          [Install]
+          WantedBy=multi-user.target
+          UNITEOF
+
+          cat > /etc/systemd/system/mc-configure.service <<'UNITEOF'
+          [Unit]
+          Description=Apply gamerules once the server accepts commands
+          After=minecraft.service
+          Requires=minecraft.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/bin/mc-configure.sh
+
+          [Install]
+          WantedBy=multi-user.target
+          UNITEOF
+
+          cat > /etc/systemd/system/mc-idle-watchdog.service <<'UNITEOF'
+          [Unit]
+          Description=Stop the instance when no players are connected
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/mc-idle-watchdog.sh
+          UNITEOF
+
+          cat > /etc/systemd/system/mc-idle-watchdog.timer <<'UNITEOF'
+          [Unit]
+          Description=Check for idle Minecraft server every minute
+
+          [Timer]
+          OnBootSec=2min
+          OnUnitActiveSec=1min
+
+          [Install]
+          WantedBy=timers.target
+          UNITEOF
+
+          cat > /etc/systemd/system/mc-backup.service <<'UNITEOF'
+          [Unit]
+          Description=Upload world archive to S3
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/mc-backup.sh
+          UNITEOF
+
+          cat > /etc/systemd/system/mc-backup.timer <<'UNITEOF'
+          [Unit]
+          Description=Periodic world archive while the server is running
+
+          [Timer]
+          OnBootSec=30min
+          OnUnitActiveSec=6h
+
+          [Install]
+          WantedBy=timers.target
+          UNITEOF
+
+          systemctl daemon-reload
+          systemctl enable --now mc-dns-update.service
+          systemctl enable --now minecraft.service
+          systemctl enable --now mc-configure.service
+          systemctl enable --now mc-idle-watchdog.timer
+          systemctl enable --now mc-backup.timer
+          systemctl enable --now mc-health-check.timer
+
+  # The A record is deliberately NOT managed here. The instance UPSERTs it on
+  # every boot because its public IP changes each start, and having both
+  # CloudFormation and the instance own the same record makes stack creation
+  # fail with "record already exists" after the first deployment.
+  #
+  # Wake-on-join does not depend on the record existing: Route 53 logs the
+  # query either way, which is what triggers the Lambda. Between the stack
+  # being created and first boot there is simply no A record; after that it
+  # holds the last known IP, so a join attempt while asleep fails fast.
+
+  # ------------------------------------------------------------------ backups
+  DlmRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: dlm.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole
+
+  SnapshotPolicy:
+    Type: AWS::DLM::LifecyclePolicy
+    Properties:
+      # DLM only accepts [0-9A-Za-z _-] here — no commas, parens or tildes
+      Description: 12-hourly EBS snapshots 14 retained about 7 days US-04
+      State: ENABLED
+      ExecutionRoleArn: !GetAtt DlmRole.Arn
+      PolicyDetails:
+        ResourceTypes: [VOLUME]
+        TargetTags:
+          - Key: Backup
+            Value: minecraft
+        Schedules:
+          - Name: twice-daily
+            CreateRule:
+              Interval: 12
+              IntervalUnit: HOURS
+              Times: ["03:00"]
+            RetainRule:
+              Count: 14
+            CopyTags: true
+
+  # ---------------------------------------------------------------- alerting
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Minecraft server alerts
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref AlertTopic
+
+  SystemHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: EC2 system status check failing — attempt automatic recovery
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_System
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref MinecraftServer
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      # Stopped instances report no data — that's normal here, not a fault
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Sub "arn:aws:automate:${AWS::Region}:ec2:recover"
+        - !Ref AlertTopic
+
+Outputs:
+  InstanceId:
+    Description: Pass this to 01-wake.yaml as the InstanceId parameter
+    Value: !Ref MinecraftServer
+  ServerAddress:
+    Description: Address players put into Minecraft
+    Value: !Ref ServerHostname
+  BackupBucketName:
+    Value: !Ref BackupBucket
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  SsmConnectCommand:
+    Description: Shell onto the box without SSH keys
+    Value: !Sub "aws ssm start-session --target ${MinecraftServer} --region ${AWS::Region}"

@@ -1,0 +1,18 @@
+[
+  { "ParameterKey": "HostedZoneId", "ParameterValue": "REPLACE_WITH_ZONE_STACK_OUTPUT" },
+  { "ParameterKey": "ServerHostname", "ParameterValue": "mc.hamishburke.dev" },
+  { "ParameterKey": "AlertEmail", "ParameterValue": "you@example.com" },
+  { "ParameterKey": "MinecraftVersion", "ParameterValue": "latest" },
+  { "ParameterKey": "QolPlugins", "ParameterValue": "essentialsx,gravesx" },
+  { "ParameterKey": "PlayersSleepingPercentage", "ParameterValue": "1" },
+  { "ParameterKey": "WhitelistUsernames", "ParameterValue": "YourName,Friend1,Friend2" },
+  { "ParameterKey": "OperatorUsername", "ParameterValue": "YourName" },
+  { "ParameterKey": "InstanceType", "ParameterValue": "t4g.medium" },
+  { "ParameterKey": "VolumeSizeGb", "ParameterValue": "20" },
+  { "ParameterKey": "JavaHeapMb", "ParameterValue": "3072" },
+  { "ParameterKey": "IdleShutdownMinutes", "ParameterValue": "20" },
+  { "ParameterKey": "MaxPlayers", "ParameterValue": "8" },
+  { "ParameterKey": "Difficulty", "ParameterValue": "normal" },
+  { "ParameterKey": "ViewDistance", "ParameterValue": "10" },
+  { "ParameterKey": "SimulationDistance", "ParameterValue": "8" }
+]

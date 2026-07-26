@@ -1,0 +1,75 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Delegated Route 53 public hosted zone for the Minecraft subdomain, with DNS
+  query logging enabled — the query log is what triggers wake-on-join.
+  Deploy this FIRST, to us-east-1. Route 53 public zone query logging can only
+  write to CloudWatch Logs in us-east-1, which is why this stack lives there
+  even though the server itself runs in Auckland.
+
+  After deploying, copy the output nameservers into Cloudflare as NS records so
+  the subdomain is delegated to AWS. The parent domain stays on Cloudflare and
+  nothing about the existing site changes.
+
+Parameters:
+  ServerHostname:
+    Type: String
+    Default: mc.hamishburke.dev
+    Description: >
+      Subdomain to delegate. This becomes its own hosted zone, and the A record
+      the server publishes sits at the zone apex.
+
+Resources:
+  # Route 53 will only log to a group under /aws/route53/. One day of retention
+  # is plenty — these logs are a trigger, not a record we ever read back.
+  QueryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/route53/${ServerHostname}"
+      RetentionInDays: 1
+
+  QueryLogResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-route53-logging"
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "Service": "route53.amazonaws.com" },
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/route53/*"
+          }]
+        }
+
+  # Retained on stack deletion so tearing the server down for months (US-17)
+  # doesn't invalidate the NS records sitting in Cloudflare.
+  #
+  # Query logging is a property of the zone, not a standalone resource — there
+  # is no AWS::Route53::QueryLoggingConfig type.
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn: QueryLogResourcePolicy
+    Properties:
+      Name: !Ref ServerHostname
+      HostedZoneConfig:
+        Comment: Minecraft server - delegated from Cloudflare
+      QueryLoggingConfig:
+        CloudWatchLogsLogGroupArn: !GetAtt QueryLogGroup.Arn
+
+Outputs:
+  HostedZoneId:
+    Description: Put this in server.json
+    Value: !Ref HostedZone
+  QueryLogGroupName:
+    Description: Put this in wake.json
+    Value: !Ref QueryLogGroup
+  NameServers:
+    Description: >
+      Add each of these to Cloudflare as an NS record on the "mc" name,
+      DNS only (grey cloud). Proxying must stay off.
+    Value: !Join [", ", !GetAtt HostedZone.NameServers]
+  ServerHostname:
+    Value: !Ref ServerHostname
