@@ -29,6 +29,8 @@ Route 53 query logging for a public hosted zone can only write to CloudWatch Log
 in **us-east-1**, which is why the wake machinery is a separate stack in a
 separate region from the server itself.
 
+See [docs/architecture.md](docs/architecture.md) for the full resource diagram.
+
 ## Prerequisites
 
 1. **An AWS account.** At signup choose the **Paid plan, not the Free plan** —
