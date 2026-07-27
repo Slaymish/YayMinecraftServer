@@ -8,6 +8,10 @@
     "ParameterValue": "mc.hamishburke.dev"
   },
   {
+    "ParameterKey": "MinecraftHostname",
+    "ParameterValue": "play.mc.hamishburke.dev"
+  },
+  {
     "ParameterKey": "ServerRegion",
     "ParameterValue": "ap-southeast-6"
   },

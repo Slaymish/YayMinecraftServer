@@ -10,15 +10,21 @@ Notes vault. Solution decision: **Option A1**, recorded there under *Chosen Solu
 ## How it works
 
 ```
-Player opens Minecraft
-   → client resolves mc.hamishburke.dev
-      → Route 53 answers, logs the query to CloudWatch Logs (us-east-1)
-         (query logging is a property of the hosted zone — there is no
-          standalone AWS::Route53::QueryLoggingConfig resource type)
-         → subscription filter fires the wake Lambda
-            → Lambda calls StartInstances in ap-southeast-6
-               → instance boots, publishes its new public IP to Route 53
-                  → player refreshes the server list and joins (~60s)
+Browser opens mc.hamishburke.dev
+   → Route 53 sends it to CloudFront
+      → CloudFront serves the joining page from a private S3 bucket (always on)
+         → /api requests reach API Gateway + Lambda
+            → status/start checks EC2 and player names through SSM/RCON
+            → whitelist requests are stored in DynamoDB for mcctl review
+
+Player opens Minecraft with mc.hamishburke.dev
+   → Java client resolves _minecraft._tcp.mc.hamishburke.dev
+      → SRV record points to play.mc.hamishburke.dev:25565
+         → Route 53 logs the Minecraft DNS query to CloudWatch Logs (us-east-1)
+            → subscription filter fires the wake Lambda
+               → Lambda calls StartInstances in ap-southeast-6
+                  → instance publishes play.mc.hamishburke.dev → its public IP
+                     → player refreshes the server list and joins (~60s)
 
 ...20 minutes with nobody connected...
    → idle watchdog backs the world up to S3 and runs `shutdown -h now`
@@ -28,6 +34,10 @@ Player opens Minecraft
 Route 53 query logging for a public hosted zone can only write to CloudWatch Logs
 in **us-east-1**, which is why the wake machinery is a separate stack in a
 separate region from the server itself.
+
+The website is separated from the game server using Minecraft Java's standard
+SRV lookup. This keeps HTTPS available while EC2 sleeps; CloudFront, ACM, and the
+tiny S3 object normally cost nothing or a few cents at this traffic level.
 
 See [docs/architecture.md](docs/architecture.md) for the full resource diagram.
 
@@ -92,7 +102,7 @@ nameservers rather than Cloudflare's or nothing.
 > add an `mc` A record directly in Cloudflare instead, orange-cloud it and
 > nothing will connect.
 
-### Step 2 — deploy the stacks
+### Step 2 — deploy the server and stage the website
 
 ```bash
 cp infra/params/server.example.json infra/params/server.json
@@ -105,9 +115,20 @@ usernames.
 
 ```bash
 make deploy-server          # Auckland: VPC, EC2, backups, alerting
-make outputs                # copy InstanceId into infra/params/wake.json
-make deploy-wake            # us-east-1: wake Lambda, subscription, budget
+make deploy-site PUBLISH_APEX=false  # stage S3, CloudFront, TLS and SRV
+make deploy-wake            # us-east-1: wake Lambda, subscriptions, budget
 ```
+
+`deploy-site` initially leaves the old apex A record untouched. Once
+`play.mc.hamishburke.dev` exists and the CloudFront distribution is ready:
+
+```bash
+make cutover-site           # replace the EC2 apex A with CloudFront A/AAAA aliases
+```
+
+This one-time cutover keeps `mc.hamishburke.dev` as both the HTTPS website and
+the address players enter. The Java client follows the SRV record to the game
+server automatically.
 
 Then confirm the SNS subscription email so alerts actually reach you.
 
@@ -136,7 +157,7 @@ make tui        # or ./mcctl
   Server
     State            running
     Public IP        13.x.x.x
-    DNS A record     13.x.x.x
+    Minecraft A      13.x.x.x
 
   Cost this month
     Amazon EC2                     USD    1.42
@@ -145,7 +166,8 @@ make tui        # or ./mcctl
 ```
 
 Keys: `s`/`x` start and stop, `w` add someone to the whitelist, `l` list it,
-`b` back up now, `k` list archives, `t` tail the server log, `e` shell in,
+`p` review website whitelist requests, `b` back up now, `k` list archives,
+`t` tail the server log, `e` shell in,
 `c` load costs, `d` deploy or update stacks, `r` refresh.
 
 It's Python stdlib only — nothing to install — and it shells out to the AWS CLI,

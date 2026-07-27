@@ -7,6 +7,8 @@ credentials of its own. Run it with `./mcctl` or `make tui`.
 
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import time
@@ -19,10 +21,13 @@ PROFILE = os.environ.get("AWS_PROFILE", "personal")
 SERVER_REGION = os.environ.get("SERVER_REGION", "ap-southeast-6")
 WAKE_REGION = "us-east-1"
 HOSTNAME = os.environ.get("HOSTNAME_OVERRIDE", "mc.hamishburke.dev")
+MINECRAFT_HOSTNAME = os.environ.get("MINECRAFT_HOSTNAME_OVERRIDE", f"play.{HOSTNAME}")
 
 ZONE_STACK = "minecraft-zone"
 SERVER_STACK = "minecraft-server"
 WAKE_STACK = "minecraft-wake"
+CONTROL_TABLE = "minecraft-control"
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
 
 # Rough conversion for the cost display only. USD is what AWS actually bills.
 NZD_PER_USD = 1.73
@@ -101,7 +106,7 @@ def dns_record():
         return None
     data = aws(["route53", "list-resource-record-sets",
                 "--hosted-zone-id", zone_id,
-                "--query", f"ResourceRecordSets[?Name=='{HOSTNAME}.'"
+                "--query", f"ResourceRecordSets[?Name=='{MINECRAFT_HOSTNAME}.'"
                             "&&Type=='A'].ResourceRecords[0].Value"])
     return data[0] if data else None
 
@@ -128,6 +133,22 @@ def params_ready():
                 missing.append(name)
                 break
     return missing
+
+
+def pending_whitelist_requests():
+    values = json.dumps({":pk": {"S": "REQUEST"}, ":pending": {"S": "pending"}})
+    data = aws(["dynamodb", "query", "--region", WAKE_REGION,
+                "--table-name", CONTROL_TABLE,
+                "--key-condition-expression", "pk = :pk",
+                "--filter-expression", "#state = :pending",
+                "--expression-attribute-names", json.dumps({"#state": "state"}),
+                "--expression-attribute-values", values])
+    if not data:
+        return []
+    requests = [{"username": item["username"]["S"],
+                 "submittedAt": int(item["submittedAt"]["N"])}
+                for item in data.get("Items", [])]
+    return sorted(requests, key=lambda item: item["submittedAt"])
 
 
 def month_to_date_cost():
@@ -170,7 +191,7 @@ def colour_stack(status):
 
 def gather():
     """Fetch everything in parallel — serial AWS calls make this feel sluggish."""
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=7) as pool:
         jobs = {
             "zone": pool.submit(stack_state, ZONE_STACK, WAKE_REGION),
             "server": pool.submit(stack_state, SERVER_STACK, SERVER_REGION),
@@ -178,6 +199,7 @@ def gather():
             "instance": pool.submit(instance_info),
             "dns": pool.submit(dns_record),
             "delegation": pool.submit(delegation),
+            "requests": pool.submit(pending_whitelist_requests),
         }
         return {key: job.result() for key, job in jobs.items()}
 
@@ -204,7 +226,13 @@ def render(snapshot, cost_rows, notes):
     dns = snapshot["dns"]
     if dns == "192.0.2.1":
         dns = f"{DIM}192.0.2.1 (asleep placeholder){RESET}"
-    print(f"    DNS A record     {dns or '—'}\n")
+    print(f"    Minecraft A      {dns or '—'}\n")
+
+    requests = snapshot["requests"]
+    pending_text = (f"{YELLOW}{len(requests)} pending{RESET}"
+                    if requests else f"{DIM}none pending{RESET}")
+    print(f"  {BOLD}Whitelist requests{RESET}")
+    print(f"    Web submissions  {pending_text}\n")
 
     print(f"  {BOLD}Cost this month{RESET}")
     if cost_rows is None:
@@ -226,7 +254,7 @@ def render(snapshot, cost_rows, notes):
 
     print(f"  {DIM}{'─' * 66}{RESET}")
     print(f"  [r] refresh   [s] start    [x] stop      [c] cost")
-    print(f"  [w] whitelist add          [l] whitelist list")
+    print(f"  [w] whitelist add          [l] whitelist list   [p] review requests")
     print(f"  [b] backup now             [k] list backups")
     print(f"  [t] tail logs [e] shell    [d] deploy    [q] quit")
     print()
@@ -248,7 +276,8 @@ def ssm_run(instance_id, command, label):
         time.sleep(2)
         result = aws(["ssm", "get-command-invocation", "--region", SERVER_REGION,
                       "--command-id", command_id, "--instance-id", instance_id])
-        if result and result["Status"] in ("Success", "Failed"):
+        if result and result["Status"] in (
+                "Success", "Failed", "Cancelled", "TimedOut", "Cancelling"):
             out = (result.get("StandardOutputContent")
                    or result.get("StandardErrorContent") or "(no output)")
             return out.strip()
@@ -270,8 +299,11 @@ def action_whitelist_add(snapshot):
     name = input("\n  Minecraft username to add: ").strip()
     if not name:
         return
+    if not USERNAME_RE.fullmatch(name):
+        print(f"\n  {YELLOW}Use a valid 3–16 character Minecraft username.{RESET}")
+        return
     print("\n" + ssm_run(instance_id,
-                         f'/usr/local/bin/mc-rcon "whitelist add {name}"',
+                         f'/usr/local/bin/mc-rcon "whitelist add {shlex.quote(name)}"',
                          f"adding {name}"))
 
 
@@ -281,6 +313,67 @@ def action_whitelist_list(snapshot):
         return
     print("\n" + ssm_run(instance_id, '/usr/local/bin/mc-rcon "whitelist list"',
                          "reading whitelist"))
+
+
+def update_whitelist_request(username, state):
+    values = json.dumps({
+        ":state": {"S": state},
+        ":pending": {"S": "pending"},
+        ":handled": {"N": str(int(time.time()))},
+    })
+    return run(["aws", "dynamodb", "update-item", "--region", WAKE_REGION,
+                "--table-name", CONTROL_TABLE,
+                "--key", json.dumps({"pk": {"S": "REQUEST"},
+                                     "sk": {"S": username.lower()}}),
+                "--update-expression",
+                "SET #state = :state, handledAt = :handled REMOVE expiresAt",
+                "--condition-expression", "#state = :pending",
+                "--expression-attribute-names", json.dumps({"#state": "state"}),
+                "--expression-attribute-values", values], timeout=30)
+
+
+def action_review_requests(snapshot):
+    requests = snapshot["requests"]
+    if not requests:
+        print(f"\n  {DIM}No pending whitelist requests.{RESET}")
+        return
+
+    print(f"\n  {BOLD}Pending whitelist requests{RESET}")
+    for index, request in enumerate(requests, 1):
+        print(f"    {index}) {request['username']}")
+    choice = input("\n  Request number [enter to cancel]: ").strip()
+    if not choice.isdigit() or not 1 <= int(choice) <= len(requests):
+        return
+    username = requests[int(choice) - 1]["username"]
+    decision = input(f"  [a] approve {username}   [r] reject: ").strip().lower()
+    if decision not in ("a", "r"):
+        return
+
+    if decision == "r":
+        ok, out = update_whitelist_request(username, "rejected")
+        print(f"\n  {GREEN}Rejected {username}.{RESET}" if ok else
+              f"\n  {RED}Could not reject request: {out}{RESET}")
+        return
+
+    instance_id = require_running(snapshot)
+    if not instance_id:
+        print(f"  {DIM}The request remains pending.{RESET}")
+        return
+    if not USERNAME_RE.fullmatch(username):
+        print(f"\n  {RED}Stored username is invalid; request left pending.{RESET}")
+        return
+    output = ssm_run(instance_id,
+                     f'/usr/local/bin/mc-rcon "whitelist add {shlex.quote(username)}"',
+                     f"adding {username}")
+    print("\n" + output)
+    lowered = output.lower()
+    if not (("added" in lowered and "whitelist" in lowered)
+            or "already whitelisted" in lowered):
+        print(f"\n  {YELLOW}Could not confirm the whitelist change; request left pending.{RESET}")
+        return
+    ok, out = update_whitelist_request(username, "approved")
+    print(f"\n  {GREEN}Approved {username}.{RESET}" if ok else
+          f"\n  {RED}Whitelisted, but could not close the request: {out}{RESET}")
 
 
 def action_backup(snapshot):
@@ -381,6 +474,7 @@ def main():
             "x": lambda: action_power(snapshot, False),
             "w": lambda: action_whitelist_add(snapshot),
             "l": lambda: action_whitelist_list(snapshot),
+            "p": lambda: action_review_requests(snapshot),
             "b": lambda: action_backup(snapshot),
             "k": action_list_backups,
             "d": action_deploy,

@@ -7,14 +7,18 @@ WAKE_REGION   := us-east-1
 SERVER_STACK  ?= minecraft-server
 WAKE_STACK    ?= minecraft-wake
 ZONE_STACK    ?= minecraft-zone
+SITE_STACK    ?= minecraft-site
 HOSTNAME      ?= mc.hamishburke.dev
+MINECRAFT_HOSTNAME ?= play.$(HOSTNAME)
+PUBLISH_APEX  ?= true
 
 SERVER_PARAMS := infra/params/server.json
 WAKE_PARAMS   := infra/params/wake.json
+SITE_FILE     := infra/site/index.html
 
 .PHONY: help validate deploy-zone nameservers check-delegation deploy-server \
-        deploy-wake deploy outputs status start stop console logs wake-logs \
-        backup-now list-backups destroy
+        deploy-site cutover-site deploy-wake deploy outputs status start stop \
+        console logs wake-logs backup-now list-backups destroy
 
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -28,6 +32,8 @@ validate: ## Check all templates parse server-side
 		--template-body file://infra/00-zone.yaml >/dev/null && echo "00-zone.yaml OK"
 	aws cloudformation validate-template --region $(SERVER_REGION) \
 		--template-body file://infra/02-server.yaml >/dev/null && echo "02-server.yaml OK"
+	aws cloudformation validate-template --region $(WAKE_REGION) \
+		--template-body file://infra/03-site.yaml >/dev/null && echo "03-site.yaml OK"
 	aws cloudformation validate-template --region $(WAKE_REGION) \
 		--template-body file://infra/01-wake.yaml >/dev/null && echo "01-wake.yaml OK"
 
@@ -66,7 +72,7 @@ check-delegation: ## Step 3: verify Cloudflare is delegating to Route 53 yet
 	@echo "Expect AWS nameservers (ns-*.awsdns-*). If empty or Cloudflare's,"
 	@echo "delegation hasn't propagated yet — wait and re-run."
 
-deploy-server: ## Step 4: deploy the Minecraft server stack to Auckland
+deploy-server: ## Deploy the Minecraft server stack to Auckland
 	aws cloudformation deploy \
 		--region $(SERVER_REGION) \
 		--stack-name $(SERVER_STACK) \
@@ -74,7 +80,49 @@ deploy-server: ## Step 4: deploy the Minecraft server stack to Auckland
 		--capabilities CAPABILITY_IAM \
 		--parameter-overrides file://$(SERVER_PARAMS)
 
-deploy-wake: ## Step 5: deploy wake-on-join + budget (needs InstanceId from step 4)
+deploy-site: ## Deploy/upload the static site; PUBLISH_APEX=true makes it public
+	@ZONE_ID=$$(aws cloudformation describe-stacks --region $(WAKE_REGION) \
+		--stack-name $(ZONE_STACK) \
+		--query "Stacks[0].Outputs[?OutputKey=='HostedZoneId'].OutputValue" --output text); \
+	API_DOMAIN=$$(aws cloudformation describe-stacks --region $(WAKE_REGION) \
+		--stack-name $(WAKE_STACK) \
+		--query "Stacks[0].Outputs[?OutputKey=='PublicApiDomainName'].OutputValue" --output text); \
+	aws cloudformation deploy \
+		--region $(WAKE_REGION) \
+		--stack-name $(SITE_STACK) \
+		--template-file infra/03-site.yaml \
+		--parameter-overrides HostedZoneId=$$ZONE_ID ServerHostname=$(HOSTNAME) \
+			MinecraftHostname=$(MINECRAFT_HOSTNAME) ApiDomainName=$$API_DOMAIN \
+			PublishApexAliases=$(PUBLISH_APEX)
+	@BUCKET=$$(aws cloudformation describe-stacks --region $(WAKE_REGION) \
+		--stack-name $(SITE_STACK) \
+		--query "Stacks[0].Outputs[?OutputKey=='SiteBucketName'].OutputValue" --output text); \
+	aws s3 cp $(SITE_FILE) s3://$$BUCKET/index.html \
+		--content-type text/html --cache-control 'public,max-age=300'
+	@DIST=$$(aws cloudformation describe-stacks --region $(WAKE_REGION) \
+		--stack-name $(SITE_STACK) \
+		--query "Stacks[0].Outputs[?OutputKey=='DistributionId'].OutputValue" --output text); \
+	aws cloudfront create-invalidation --distribution-id $$DIST --paths /index.html >/dev/null; \
+	echo "Site uploaded; CloudFront invalidation requested."
+
+cutover-site: ## Replace the old EC2 apex A record with the CloudFront website
+	@ZONE_ID=$$(aws cloudformation describe-stacks --region $(WAKE_REGION) \
+		--stack-name $(ZONE_STACK) \
+		--query "Stacks[0].Outputs[?OutputKey=='HostedZoneId'].OutputValue" --output text); \
+	PLAY_IP=$$(aws route53 list-resource-record-sets --hosted-zone-id $$ZONE_ID \
+		--query "ResourceRecordSets[?Name=='$(MINECRAFT_HOSTNAME).' && Type=='A'].ResourceRecords[0].Value | [0]" \
+		--output text); \
+	[ "$$PLAY_IP" != "None" ] || { echo "$(MINECRAFT_HOSTNAME) has no A record; aborting"; exit 1; }; \
+	OLD_IP=$$(aws route53 list-resource-record-sets --hosted-zone-id $$ZONE_ID \
+		--query "ResourceRecordSets[?Name=='$(HOSTNAME).' && Type=='A'].ResourceRecords[0].Value | [0]" \
+		--output text); \
+	if [ "$$OLD_IP" != "None" ]; then \
+		aws route53 change-resource-record-sets --hosted-zone-id $$ZONE_ID \
+			--change-batch "{\"Changes\":[{\"Action\":\"DELETE\",\"ResourceRecordSet\":{\"Name\":\"$(HOSTNAME)\",\"Type\":\"A\",\"TTL\":60,\"ResourceRecords\":[{\"Value\":\"$$OLD_IP\"}]}}]}" >/dev/null; \
+	fi
+	@$(MAKE) --no-print-directory deploy-site PUBLISH_APEX=true
+
+deploy-wake: ## Deploy wake-on-Minecraft-query and budget alerts
 	aws cloudformation deploy \
 		--region $(WAKE_REGION) \
 		--stack-name $(WAKE_STACK) \
@@ -82,7 +130,7 @@ deploy-wake: ## Step 5: deploy wake-on-join + budget (needs InstanceId from step
 		--capabilities CAPABILITY_IAM \
 		--parameter-overrides file://$(WAKE_PARAMS)
 
-deploy: deploy-server deploy-wake ## Deploy both stacks in order
+deploy: deploy-wake deploy-server deploy-site ## Deploy API/wake, server, and site stacks
 
 outputs: ## Show stack outputs (server address, instance ID, connect command)
 	@aws cloudformation describe-stacks --region $(SERVER_REGION) \

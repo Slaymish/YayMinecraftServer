@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#171b16">
+  <title>Hamish's Minecraft Server</title>
+  <style>
+    :root{color-scheme:dark;--bg:#171b16;--panel:#20271f;--border:#3d4938;--text:#f3f0df;--muted:#b8c0ad;--green:#8fcf62}
+    *{box-sizing:border-box}
+    body{min-height:100vh;margin:0;display:grid;place-items:center;padding:24px;background:var(--bg);color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;line-height:1.55}
+    main{width:min(100%,640px);padding:clamp(28px,7vw,52px);border:1px solid var(--border);border-top:4px solid var(--green);background:var(--panel);box-shadow:12px 12px 0 #10130f}
+    .eyebrow{margin:0 0 14px;color:var(--green);font-size:.78rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase}
+    h1{max-width:12ch;margin:0 0 16px;font-family:Georgia,serif;font-size:clamp(2.4rem,9vw,4.8rem);font-weight:400;letter-spacing:-.055em;line-height:.96}
+    .intro,section p,.status-detail{color:var(--muted)}.intro{max-width:48ch;margin:0 0 30px}
+    label{display:block;margin-bottom:8px;font-size:.75rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase}
+    .address,.request{display:flex;gap:8px}.address{margin-bottom:32px}.request{margin-top:14px}
+    input,button{min-height:48px;border:1px solid var(--border);border-radius:0;font:inherit}
+    input{min-width:0;flex:1;padding:0 14px;background:#131712;color:var(--text)}
+    button{padding:0 18px;border-color:var(--green);background:#27481e;color:var(--text);cursor:pointer;font-weight:700}
+    button:hover{background:#335c28}button:focus-visible,input:focus-visible{outline:3px solid var(--green);outline-offset:3px}
+    section{padding-top:24px;border-top:1px solid var(--border)}section+section{margin-top:24px}
+    h2{margin:0 0 8px;font-size:1rem}section p{margin:0}strong{color:var(--text)}
+    .status-row{display:flex;align-items:center;justify-content:space-between;gap:16px}.status-name{display:flex;align-items:center;gap:9px;font-weight:700}
+    .dot{width:10px;height:10px;background:#d5a94e;box-shadow:0 0 0 3px #4d4026}.dot.online{background:var(--green);box-shadow:0 0 0 3px #304b28}.dot.asleep{background:#879080;box-shadow:0 0 0 3px #343a31}
+    .status-detail{margin-top:8px}#wake-server{margin-top:14px}.feedback{min-height:1.5em;margin:8px 0 0;color:var(--green);font-size:.8rem}.hidden{display:none}
+    @media(max-width:480px){.address,.request{flex-direction:column}button{width:100%}main{box-shadow:7px 7px 0 #10130f}}
+  </style>
+</head>
+<body>
+  <main>
+    <p class="eyebrow">Java Edition · Whitelist only</p>
+    <h1>Hamish's Minecraft server.</h1>
+    <p class="intro">A small private server for friends. Add the address below in Minecraft to join.</p>
+    <label for="server-address">Server address</label>
+    <div class="address">
+      <input id="server-address" value="mc.hamishburke.dev" readonly>
+      <button id="copy-address" type="button">Copy address</button>
+    </div>
+    <p id="copy-status" class="feedback" role="status" aria-live="polite"></p>
+    <section aria-labelledby="server-status-heading">
+      <div class="status-row">
+        <h2 id="server-status-heading">Server status</h2>
+        <span class="status-name"><span id="status-dot" class="dot"></span><span id="status-name">Checking…</span></span>
+      </div>
+      <p id="status-detail" class="status-detail" aria-live="polite">Asking the server for its status.</p>
+      <button id="wake-server" class="hidden" type="button">Turn server on</button>
+    </section>
+    <section>
+      <h2>Need access?</h2>
+      <p>Send Hamish your exact Minecraft username. He'll review it and add you to the whitelist.</p>
+      <form id="whitelist-form" class="request">
+        <input id="minecraft-username" name="username" aria-label="Minecraft username" placeholder="Minecraft username" pattern="[A-Za-z0-9_]{3,16}" minlength="3" maxlength="16" autocomplete="off" required>
+        <button type="submit">Request access</button>
+      </form>
+      <p id="request-status" class="feedback" role="status" aria-live="polite"></p>
+    </section>
+    <section>
+      <h2>Can't connect yet?</h2>
+      <p>The Minecraft server shuts itself down when nobody is playing to avoid running an AWS machine unnecessarily. Trying to connect wakes it up. <strong>Wait 1–2 minutes, then reconnect.</strong></p>
+    </section>
+  </main>
+  <script>
+    const address=document.getElementById('server-address');
+    const button=document.getElementById('copy-address');
+    const copyStatus=document.getElementById('copy-status');
+    const statusName=document.getElementById('status-name');
+    const statusDot=document.getElementById('status-dot');
+    const statusDetail=document.getElementById('status-detail');
+    const wakeButton=document.getElementById('wake-server');
+    const requestForm=document.getElementById('whitelist-form');
+    const requestStatus=document.getElementById('request-status');
+    button.addEventListener('click',async()=>{
+      try{
+        if(navigator.clipboard)await navigator.clipboard.writeText(address.value);
+        else{address.select();document.execCommand('copy')}
+        button.textContent='Copied!';copyStatus.textContent='Server address copied to clipboard.';
+      }catch(_){address.select();copyStatus.textContent='Select the address and copy it manually.'}
+      setTimeout(()=>button.textContent='Copy address',2000);
+    });
+
+    function showStatus(data){
+      statusDot.className='dot '+data.status;
+      wakeButton.classList.add('hidden');
+      if(data.status==='asleep'){
+        statusName.textContent='Asleep';
+        statusDetail.textContent='The server is switched off to save money. Turn it on here, or try connecting in Minecraft and reconnect after 1–2 minutes.';
+        wakeButton.classList.remove('hidden');
+      }else if(data.status==='online'){
+        statusName.textContent='Online';
+        const names=(data.players||[]).join(', ');
+        statusDetail.textContent=data.count===0?'Nobody is playing right now.':data.count+' player'+(data.count===1?'':'s')+' online'+(names?': '+names:'.');
+      }else{
+        statusName.textContent='Starting';
+        statusDetail.textContent='The server is waking up. Give it 1–2 minutes, then reconnect in Minecraft.';
+      }
+    }
+
+    async function refreshStatus(){
+      try{
+        const response=await fetch('/api/status',{cache:'no-store'});
+        if(!response.ok)throw new Error();
+        showStatus(await response.json());
+      }catch(_){
+        statusName.textContent='Unavailable';
+        statusDetail.textContent='Status could not be checked. You can still try connecting in Minecraft.';
+      }
+    }
+
+    wakeButton.addEventListener('click',async()=>{
+      wakeButton.disabled=true;wakeButton.textContent='Starting…';
+      try{
+        const response=await fetch('/api/start',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});
+        if(!response.ok)throw new Error();
+        showStatus({status:'starting'});
+      }catch(_){
+        statusDetail.textContent='Could not start it here. Try connecting in Minecraft to wake it instead.';
+      }finally{wakeButton.disabled=false;wakeButton.textContent='Turn server on'}
+    });
+
+    requestForm.addEventListener('submit',async event=>{
+      event.preventDefault();
+      const username=requestForm.elements.username.value.trim();
+      const submit=requestForm.querySelector('button');
+      submit.disabled=true;requestStatus.textContent='Sending request…';
+      try{
+        const response=await fetch('/api/whitelist-requests',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({username})});
+        const data=await response.json();
+        if(!response.ok)throw new Error(data.error||'Could not send request');
+        requestStatus.textContent='Request sent. Hamish will review it soon.';
+        requestForm.reset();
+      }catch(error){requestStatus.textContent=error.message||'Could not send request. Try again later.'}
+      finally{submit.disabled=false}
+    });
+
+    refreshStatus();
+    setInterval(refreshStatus,30000);
+  </script>
+</body>
+</html>

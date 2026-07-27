@@ -16,6 +16,11 @@ sudo mc-rcon "whitelist remove SomeoneElse"
 
 Or from inside the game as an operator: `/whitelist add <name>`.
 
+Website requests appear in `make tui` under **Whitelist requests**. Press `p`
+to review one, then approve or reject it. Approval only closes the request after
+RCON confirms the player was added (or was already whitelisted); if the server
+is asleep, start it first and retry so the request remains pending.
+
 To make it survive a rebuild, also update `WhitelistUsernames` in
 `infra/params/server.json`.
 
@@ -57,9 +62,11 @@ Work through in order:
 1. `make status` — if it says `running`, the wake worked and the problem is
    elsewhere (check `make logs`).
 2. `make wake-logs` — did the Lambda fire at all?
-3. If nothing fired, the DNS query never reached Route 53. Usually resolver
-   caching. Confirm with `dig mc.hamishburke.dev` — if you get an answer without the
-   Lambda logging anything, it came from a cache.
+3. If nothing fired, the Minecraft DNS query never reached Route 53. Usually
+   resolver caching. Confirm with
+   `dig SRV _minecraft._tcp.mc.hamishburke.dev` and
+   `dig play.mc.hamishburke.dev` — if both answer without the Lambda logging
+   anything, they came from a cache.
 4. Check the query log group directly:
    `aws logs tail /aws/route53/<hostname> --region us-east-1 --since 10m`
 5. Fall back to `make start`.

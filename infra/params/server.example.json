@@ -1,6 +1,7 @@
 [
   { "ParameterKey": "HostedZoneId", "ParameterValue": "REPLACE_WITH_ZONE_STACK_OUTPUT" },
   { "ParameterKey": "ServerHostname", "ParameterValue": "mc.hamishburke.dev" },
+  { "ParameterKey": "MinecraftHostname", "ParameterValue": "play.mc.hamishburke.dev" },
   { "ParameterKey": "AlertEmail", "ParameterValue": "you@example.com" },
   { "ParameterKey": "MinecraftVersion", "ParameterValue": "latest" },
   { "ParameterKey": "QolPlugins", "ParameterValue": "essentialsx,gravesx" },

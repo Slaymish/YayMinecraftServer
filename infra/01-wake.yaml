@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Wake-on-join for the Minecraft server, plus budget alerting.
   MUST be deployed to us-east-1, alongside the query log group it subscribes to.
-  Deploy this stack LAST, after 02-server.yaml outputs an InstanceId.
+  Deploy this stack after the server and static site stacks.
   The hosted zone and its query logging are owned by 00-zone.yaml.
 
 Parameters:
@@ -11,7 +11,11 @@ Parameters:
     Description: QueryLogGroupName output from the 00-zone stack
   ServerHostname:
     Type: String
-    Description: Hostname to watch for, e.g. mc.hamishburke.dev
+    Description: Public address players enter, e.g. mc.hamishburke.dev
+  MinecraftHostname:
+    Type: String
+    Default: play.mc.hamishburke.dev
+    Description: Dynamic A record targeted by the Minecraft SRV record
   ServerRegion:
     Type: String
     Default: ap-southeast-6
@@ -26,6 +30,10 @@ Parameters:
       Budget ceiling in USD ex GST. NZD 10 incl GST is roughly USD 5.80 ex GST
       at NZD/USD 0.578 — 7 leaves headroom before alerting. Alerts only, no
       automatic shutdown (US-14 relaxed to soft limits).
+  ControlTableName:
+    Type: String
+    Default: minecraft-control
+    Description: DynamoDB table for public whitelist requests
 
 Resources:
   WakeFunctionRole:
@@ -56,6 +64,40 @@ Resources:
                 Condition:
                   StringEquals:
                     "ec2:ResourceTag/Role": minecraft-server
+              - Effect: Allow
+                Action: [dynamodb:UpdateItem, dynamodb:PutItem]
+                Resource: !GetAtt ControlTable.Arn
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${ServerRegion}::document/AWS-RunShellScript"
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${ServerRegion}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals:
+                    "ssm:resourceTag/Role": minecraft-server
+              - Effect: Allow
+                Action: ssm:GetCommandInvocation
+                Resource: "*"
+
+  ControlTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref ControlTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
 
   WakeFunction:
     Type: AWS::Lambda::Function
@@ -68,13 +110,25 @@ Resources:
       Environment:
         Variables:
           SERVER_REGION: !Ref ServerRegion
+          SERVER_HOSTNAME: !Ref ServerHostname
+          CONTROL_TABLE: !Ref ControlTable
       Code:
         ZipFile: |
           const {
             EC2Client, DescribeInstancesCommand, StartInstancesCommand
           } = require("@aws-sdk/client-ec2");
+          const {
+            SSMClient, SendCommandCommand, GetCommandInvocationCommand
+          } = require("@aws-sdk/client-ssm");
+          const {
+            DynamoDBClient, TransactWriteItemsCommand
+          } = require("@aws-sdk/client-dynamodb");
 
           const ec2 = new EC2Client({ region: process.env.SERVER_REGION });
+          const ssm = new SSMClient({ region: process.env.SERVER_REGION });
+          const dynamo = new DynamoDBClient({});
+          const ORIGIN = `https://${process.env.SERVER_HOSTNAME}`;
+          const USERNAME = /^[A-Za-z0-9_]{3,16}$/;
 
           // Looked up by tag every invocation so a rebuilt instance still wakes
           const FILTERS = [
@@ -85,26 +139,172 @@ Resources:
             },
           ];
 
-          exports.handler = async () => {
+          async function instance() {
             const described = await ec2.send(
               new DescribeInstancesCommand({ Filters: FILTERS })
             );
-            const instance = described.Reservations?.[0]?.Instances?.[0];
+            const instances = (described.Reservations || [])
+              .flatMap(reservation => reservation.Instances || []);
 
-            if (!instance) {
-              console.log("No instance tagged Role=minecraft-server found");
-              return { started: false };
+            if (instances.length !== 1) {
+              throw new Error(`Expected one Minecraft instance, found ${instances.length}`);
             }
+            return instances[0];
+          }
 
-            const { InstanceId, State } = instance;
+          async function start() {
+            const found = await instance();
+            const { InstanceId, State } = found;
+
             if (State.Name !== "stopped") {
               console.log(`No action: ${InstanceId} is ${State.Name}`);
-              return { started: false, state: State.Name };
+              return State.Name;
             }
 
             await ec2.send(new StartInstancesCommand({ InstanceIds: [InstanceId] }));
             console.log(`Start issued for ${InstanceId}`);
-            return { started: true, instanceId: InstanceId };
+            return "pending";
+          }
+
+          function response(statusCode, body) {
+            return {
+              statusCode,
+              headers: {
+                "content-type": "application/json",
+                "cache-control": "no-store",
+                "x-content-type-options": "nosniff",
+              },
+              body: JSON.stringify(body),
+            };
+          }
+
+          function validPost(event) {
+            const headers = event.headers || {};
+            return headers.origin === ORIGIN
+              && (headers["content-type"] || "").startsWith("application/json")
+              && Buffer.byteLength(event.body || "") <= 512;
+          }
+
+          async function playerList(instanceId) {
+            try {
+              const sent = await ssm.send(new SendCommandCommand({
+                InstanceIds: [instanceId],
+                DocumentName: "AWS-RunShellScript",
+                Parameters: { commands: ["/usr/local/bin/mc-rcon list"] },
+                TimeoutSeconds: 30,
+              }));
+              const commandId = sent.Command.CommandId;
+
+              for (let attempt = 0; attempt < 8; attempt++) {
+                await new Promise(resolve => setTimeout(resolve, 750));
+                try {
+                  const result = await ssm.send(new GetCommandInvocationCommand({
+                    CommandId: commandId,
+                    InstanceId: instanceId,
+                  }));
+                  if (result.Status === "Success") {
+                    const plain = (result.StandardOutputContent || "")
+                      .replace(/§./g, "").trim();
+                    const match = plain.match(/There are\s+(\d+).*maximum\s+(\d+).*players online\.?/i);
+                    if (!match) return null;
+                    const lines = plain.split(/\r?\n/).slice(1).join(" ").trim();
+                    return {
+                      count: Number(match[1]),
+                      max: Number(match[2]),
+                      players: lines ? lines.split(",").map(name => name.trim()).filter(Boolean) : [],
+                    };
+                  }
+                  if (["Failed", "Cancelled", "TimedOut"].includes(result.Status)) return null;
+                } catch (error) {
+                  if (error.name !== "InvocationDoesNotExist") throw error;
+                }
+              }
+            } catch (error) {
+              console.log(`Player list unavailable: ${error.name}: ${error.message}`);
+            }
+            return null;
+          }
+
+          async function http(event) {
+            const method = event.requestContext.http.method;
+            const path = event.rawPath;
+
+            if (method === "GET" && path === "/api/status") {
+              const found = await instance();
+              const state = found.State.Name;
+              if (state === "stopped") return response(200, { status: "asleep" });
+              if (state !== "running") return response(200, { status: "starting" });
+              const list = await playerList(found.InstanceId);
+              return response(200, list
+                ? { status: "online", ...list }
+                : { status: "starting" });
+            }
+
+            if (method === "POST" && path === "/api/start") {
+              if (!validPost(event)) return response(403, { error: "Request denied" });
+              const state = await start();
+              return response(202, { status: state === "running" ? "online" : "starting" });
+            }
+
+            if (method === "POST" && path === "/api/whitelist-requests") {
+              if (!validPost(event)) return response(403, { error: "Request denied" });
+              let body;
+              try { body = JSON.parse(event.body || "{}"); }
+              catch { return response(400, { error: "Invalid request" }); }
+              const username = typeof body.username === "string" ? body.username.trim() : "";
+              if (!USERNAME.test(username)) {
+                return response(400, { error: "Use a valid 3–16 character Minecraft username" });
+              }
+              const now = Math.floor(Date.now() / 1000);
+              const day = new Date().toISOString().slice(0, 10);
+              try {
+                await dynamo.send(new TransactWriteItemsCommand({
+                  TransactItems: [
+                    { Update: {
+                      TableName: process.env.CONTROL_TABLE,
+                      Key: { pk: { S: "CONTROL" }, sk: { S: `REQUEST#${day}` } },
+                      UpdateExpression: "SET expiresAt = :expires ADD #count :one",
+                      ConditionExpression: "attribute_not_exists(#count) OR #count < :limit",
+                      ExpressionAttributeNames: { "#count": "count" },
+                      ExpressionAttributeValues: {
+                        ":expires": { N: String(now + 2 * 86400) },
+                        ":one": { N: "1" },
+                        ":limit": { N: "20" },
+                      },
+                    } },
+                    { Put: {
+                      TableName: process.env.CONTROL_TABLE,
+                      Item: {
+                        pk: { S: "REQUEST" },
+                        sk: { S: username.toLowerCase() },
+                        username: { S: username },
+                        state: { S: "pending" },
+                        submittedAt: { N: String(now) },
+                        expiresAt: { N: String(now + 30 * 86400) },
+                      },
+                      ConditionExpression: "attribute_not_exists(pk)",
+                    } },
+                  ],
+                }));
+              } catch (error) {
+                if (error.name !== "TransactionCanceledException") throw error;
+                if (error.CancellationReasons?.[0]?.Code === "ConditionalCheckFailed") {
+                  return response(429, { error: "Too many requests today; message Hamish instead" });
+                }
+                if (error.CancellationReasons?.[1]?.Code !== "ConditionalCheckFailed") {
+                  throw error;
+                }
+              }
+              return response(202, { accepted: true });
+            }
+
+            return response(404, { error: "Not found" });
+          }
+
+          exports.handler = async event => {
+            if (event.requestContext?.http) return http(event);
+            const state = await start();
+            return { started: state === "pending", state };
           };
 
   WakeFunctionLogPermission:
@@ -115,15 +315,80 @@ Resources:
       Principal: !Sub "logs.${AWS::Region}.amazonaws.com"
       SourceArn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${QueryLogGroupName}:*"
 
-  # Route 53 query logs are space-delimited plain text, so a bare substring
-  # match on the hostname is the right filter here.
+  # Keep the existing logical resource so this update replaces its broad filter
+  # before adding the second one (CloudWatch Logs allows two per log group).
   WakeSubscription:
     Type: AWS::Logs::SubscriptionFilter
     DependsOn: WakeFunctionLogPermission
     Properties:
       LogGroupName: !Ref QueryLogGroupName
-      FilterPattern: !Sub '"${ServerHostname}"'
+      FilterPattern: !Sub >-
+        [version, timestamp, hostedZoneId,
+        queryName = "_minecraft._tcp.${ServerHostname}", ...]
       DestinationArn: !GetAtt WakeFunction.Arn
+
+  MinecraftTargetWakeSubscription:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn: WakeFunctionLogPermission
+    Properties:
+      LogGroupName: !Ref QueryLogGroupName
+      FilterPattern: !Sub >-
+        [version, timestamp, hostedZoneId,
+        queryName = "${MinecraftHostname}", ...]
+      DestinationArn: !GetAtt WakeFunction.Arn
+
+  PublicApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-public"
+      ProtocolType: HTTP
+
+  PublicApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PublicApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt WakeFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  StatusRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PublicApi
+      RouteKey: GET /api/status
+      Target: !Sub "integrations/${PublicApiIntegration}"
+
+  StartRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PublicApi
+      RouteKey: POST /api/start
+      Target: !Sub "integrations/${PublicApiIntegration}"
+
+  WhitelistRequestRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PublicApi
+      RouteKey: POST /api/whitelist-requests
+      Target: !Sub "integrations/${PublicApiIntegration}"
+
+  PublicApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref PublicApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 5
+        ThrottlingRateLimit: 2
+
+  PublicApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt WakeFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${PublicApi}/*"
 
   # Budgets is a us-east-1 global service, which is why it lives in this stack.
   CostBudget:
@@ -160,3 +425,8 @@ Outputs:
   TailWakeLogsCommand:
     Description: Watch wake events live while testing
     Value: !Sub "aws logs tail /aws/lambda/${WakeFunction} --follow --region ${AWS::Region}"
+  PublicApiDomainName:
+    Description: Pass to the site stack as ApiDomainName
+    Value: !Sub "${PublicApi}.execute-api.${AWS::Region}.amazonaws.com"
+  ControlTableName:
+    Value: !Ref ControlTable

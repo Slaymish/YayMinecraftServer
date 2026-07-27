@@ -4,17 +4,21 @@
 
 ```mermaid
 flowchart LR
-    P["Player"] --> D["DNS<br/>mc.hamishburke.dev"]
-    D -->|"asleep"| W["Wake trigger<br/><i>us-east-1</i>"]
+    WB["Browser"] --> C["CloudFront<br/>always-on website"]
+    C --> A["API Gateway + Lambda<br/>status, start, requests"]
+    A --> Q["DynamoDB<br/>whitelist queue"]
+    A -.->|"player list via SSM"| S
+    P["Player"] --> D["SRV lookup<br/>mc.hamishburke.dev"]
+    D -->|"play.mc… query"| W["Wake trigger<br/><i>us-east-1</i>"]
     W -->|"start"| S["Minecraft server<br/><i>Auckland</i>"]
-    D -->|"awake"| S
+    D -->|"play.mc…:25565"| S
     S -->|"idle 20 min"| Z["Stopped<br/><i>storage only</i>"]
     S --- B["Backups<br/><i>S3 + EBS snapshots</i>"]
 
     classDef box fill:#e9f7ee,stroke:#2e9e5b,color:#000
     classDef dim fill:#f2f2f2,stroke:#888,color:#000
-    class D,W,S,B box
-    class P,Z dim
+    class C,A,Q,D,W,S,B box
+    class WB,P,Z dim
 ```
 
 ## Wake and sleep sequence diagram
@@ -27,11 +31,11 @@ sequenceDiagram
     participant L as Wake Lambda
     participant E as EC2 instance
 
-    P->>R: resolve mc.hamishburke.dev
-    R-->>P: 192.0.2.1 (asleep)
+    P->>R: resolve _minecraft._tcp.mc.hamishburke.dev
+    R-->>P: SRV play.mc.hamishburke.dev:25565
     R->>L: query log → subscription filter (~15s)
     L->>E: StartInstances (~8s)
-    E->>R: UPSERT A record → new public IP
+    E->>R: UPSERT play.mc.hamishburke.dev A → new public IP
     Note over E: Paper accepting connections (~27s)
     P->>E: retry join → connected
 

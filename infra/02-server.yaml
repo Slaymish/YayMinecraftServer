@@ -10,7 +10,11 @@ Parameters:
     Description: Route 53 hosted zone ID for a domain you own (see README prerequisites)
   ServerHostname:
     Type: String
-    Description: Full hostname players connect to, e.g. mc.hamishburke.dev
+    Description: Public address players enter, e.g. mc.hamishburke.dev
+  MinecraftHostname:
+    Type: String
+    Default: play.mc.hamishburke.dev
+    Description: Dynamic EC2 DNS target used by the Minecraft SRV record
   AlertEmail:
     Type: String
     Description: Email address for outage and budget alerts (you must confirm the subscription)
@@ -193,6 +197,12 @@ Resources:
               - Effect: Allow
                 Action: route53:ChangeResourceRecordSets
                 Resource: !Sub "arn:aws:route53:::hostedzone/${HostedZoneId}"
+                Condition:
+                  ForAllValues:StringEquals:
+                    "route53:ChangeResourceRecordSetsNormalizedRecordNames":
+                      - !Ref MinecraftHostname
+                    "route53:ChangeResourceRecordSetsRecordTypes": [A]
+                    "route53:ChangeResourceRecordSetsActions": [UPSERT]
               - Effect: Allow
                 Action: route53:GetChange
                 Resource: "*"
@@ -522,7 +532,7 @@ Resources:
             --hosted-zone-id __ZONEID__ --change-batch file:///tmp/rrset.json
           logger -t mc-dns "updated __HOSTNAME__ -> $IP"
           DNSEOF
-          sed -i "s|__HOSTNAME__|${ServerHostname}|g; s|__ZONEID__|${HostedZoneId}|g" \
+          sed -i "s|__HOSTNAME__|${MinecraftHostname}|g; s|__ZONEID__|${HostedZoneId}|g" \
             /usr/local/bin/mc-dns-update.sh
           chmod +x /usr/local/bin/mc-dns-update.sh
 
@@ -739,15 +749,31 @@ Resources:
           systemctl enable --now mc-backup.timer
           systemctl enable --now mc-health-check.timer
 
-  # The A record is deliberately NOT managed here. The instance UPSERTs it on
-  # every boot because its public IP changes each start, and having both
+  # User data does not rerun when an existing EBS-backed instance restarts, so
+  # migrate its installed DNS updater from the website apex to the SRV target.
+  DnsUpdaterAssociation:
+    Type: AWS::SSM::Association
+    DependsOn: InstanceRole
+    Properties:
+      Name: AWS-RunShellScript
+      Targets:
+        - Key: InstanceIds
+          Values: [!Ref MinecraftServer]
+      Parameters:
+        commands:
+          - !Sub >-
+              if ! grep -Fq '"Name":"${MinecraftHostname}"' /usr/local/bin/mc-dns-update.sh; then sed -i 's|"Name":"${ServerHostname}"|"Name":"${MinecraftHostname}"|;s|updated ${ServerHostname} ->|updated ${MinecraftHostname} ->|' /usr/local/bin/mc-dns-update.sh; fi
+          - systemctl restart mc-dns-update.service
+
+  # The play.* A record is deliberately NOT managed here. The instance UPSERTs
+  # it on every boot because its public IP changes each start, and having both
   # CloudFormation and the instance own the same record makes stack creation
   # fail with "record already exists" after the first deployment.
   #
   # Wake-on-join does not depend on the record existing: Route 53 logs the
   # query either way, which is what triggers the Lambda. Between the stack
-  # being created and first boot there is simply no A record; after that it
-  # holds the last known IP, so a join attempt while asleep fails fast.
+  # being created and first boot there is simply no play.* A record; after that
+  # it holds the last known IP, so a join attempt while asleep fails fast.
 
   # ------------------------------------------------------------------ backups
   DlmRole:
@@ -824,6 +850,9 @@ Outputs:
   ServerAddress:
     Description: Address players put into Minecraft
     Value: !Ref ServerHostname
+  MinecraftTargetHostname:
+    Description: Dynamic A record targeted by the Minecraft SRV record
+    Value: !Ref MinecraftHostname
   BackupBucketName:
     Value: !Ref BackupBucket
   AlertTopicArn:

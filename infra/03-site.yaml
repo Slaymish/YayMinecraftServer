@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Always-on static website for the Minecraft address. Deploy to us-east-1 after
+  the delegated Route 53 zone exists. Minecraft Java uses the SRV record to
+  reach the stoppable EC2 instance without exposing the website to that lifecycle.
+
+Parameters:
+  HostedZoneId:
+    Type: String
+    Description: HostedZoneId output from the minecraft-zone stack
+  ServerHostname:
+    Type: String
+    Default: mc.hamishburke.dev
+    Description: Public website and address players enter in Minecraft
+  MinecraftHostname:
+    Type: String
+    Default: play.mc.hamishburke.dev
+    Description: Dynamic A record published by the Minecraft EC2 instance
+  ApiDomainName:
+    Type: String
+    Description: PublicApiDomainName output from the minecraft-wake stack
+  PublishApexAliases:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Publish CloudFront at the zone apex after the old EC2 A record is removed
+
+Conditions:
+  PublishAliases: !Equals [!Ref PublishApexAliases, "true"]
+
+Resources:
+  SiteCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref ServerHostname
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref ServerHostname
+          HostedZoneId: !Ref HostedZoneId
+
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-s3"
+        Description: Sign requests from CloudFront to the private site bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Aliases: !If
+          - PublishAliases
+          - [!Ref ServerHostname]
+          - !Ref AWS::NoValue
+        Comment: !Sub "Static joining page for ${ServerHostname}"
+        DefaultCacheBehavior:
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+          TargetOriginId: site-bucket
+          ViewerProtocolPolicy: redirect-to-https
+        CacheBehaviors:
+          - PathPattern: /api/*
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            Compress: true
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            TargetOriginId: public-api
+            ViewerProtocolPolicy: redirect-to-https
+        DefaultRootObject: index.html
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Origins:
+          - Id: site-bucket
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !Ref SiteOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - Id: public-api
+            DomainName: !Ref ApiDomainName
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          AcmCertificateArn: !Ref SiteCertificate
+          MinimumProtocolVersion: TLSv1.2_2021
+          SslSupportMethod: sni-only
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}"
+
+  MinecraftSrvRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "_minecraft._tcp.${ServerHostname}"
+      Type: SRV
+      TTL: 60
+      ResourceRecords:
+        - !Sub "0 0 25565 ${MinecraftHostname}."
+
+  SiteIpv4Record:
+    Type: AWS::Route53::RecordSet
+    Condition: PublishAliases
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref ServerHostname
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt SiteDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+  SiteIpv6Record:
+    Type: AWS::Route53::RecordSet
+    Condition: PublishAliases
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref ServerHostname
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt SiteDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+Outputs:
+  SiteBucketName:
+    Value: !Ref SiteBucket
+  DistributionId:
+    Value: !Ref SiteDistribution
+  DistributionDomainName:
+    Value: !GetAtt SiteDistribution.DomainName
+  MinecraftSrvName:
+    Value: !Sub "_minecraft._tcp.${ServerHostname}"

@@ -15,8 +15,8 @@ Parameters:
     Type: String
     Default: mc.hamishburke.dev
     Description: >
-      Subdomain to delegate. This becomes its own hosted zone, and the A record
-      the server publishes sits at the zone apex.
+      Subdomain to delegate. This becomes its own hosted zone; the static website
+      sits at its apex and Minecraft connects through an SRV record below it.
 
 Resources:
   # Route 53 will only log to a group under /aws/route53/. One day of retention
